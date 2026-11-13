@@ -27,6 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::filter_weights::{FilterBounds, FilterWeights};
+use crate::image_size::FractIndex;
 use crate::math::{ConstPI, ConstSqrt2, Jinc};
 use crate::sampler::ResamplingFunction;
 use num_traits::{AsPrimitive, Float, Signed};
@@ -35,6 +36,8 @@ use std::ops::{AddAssign, Div, MulAssign, Neg};
 
 pub(crate) fn generate_weights<T>(
     function: ResamplingFunction,
+    in_start: FractIndex,
+    in_end: FractIndex,
     in_size: usize,
     out_size: usize,
 ) -> FilterWeights<T>
@@ -60,10 +63,79 @@ where
     f64: AsPrimitive<T>,
     i64: AsPrimitive<T>,
     i32: AsPrimitive<T>,
+    u32: AsPrimitive<T>,
     usize: AsPrimitive<T>,
 {
+    assert!(in_start < in_end); // TODO: introduce special degenerate case if in_start = in_end
+    assert!(in_end <= FractIndex::from(in_size));
+
+    // Do index calculations in fixed point, so that they behave essentially the same
+    // at the left and the right sides of the image.
+    let fixed_sub = |from: FractIndex, to: FractIndex| -> FractIndex {
+        let (x, overflow) = to.frac.overflowing_sub(from.frac);
+        FractIndex {
+            int: to.int - from.int - overflow as usize,
+            frac: x,
+        }
+    };
+    let chain_add = |x: (usize, u32, u64), y: (usize, u32, u64)| -> (usize, u32, u64) {
+        let (z2, z2c) = x.2.carrying_add(y.2, false);
+        let (z1, z1c) = x.1.carrying_add(y.1, z2c);
+        let (z0, z0c) = x.0.carrying_add(y.0, z1c);
+        assert!(!z0c); // overflow not expected in this file
+        (z0, z1, z2)
+    };
+    let chain_div = |value: (usize, u32, usize), steps: usize| -> (usize, u32, u64) {
+        let steps_u128 = steps as u128;
+        let x1 = ((value.0 as u128) << u32::BITS) | (value.1 as u128);
+        let v1 = x1 / steps_u128;
+        let r1 = x1 % steps_u128;
+        let x2 = r1 << u64::BITS | (value.2 as u128);
+        let v2 = x2 / steps_u128;
+
+        let o1 = (
+            ((v1 >> u32::BITS) as usize),
+            (v1 & u32::MAX as u128) as u32,
+            0,
+        );
+        let o2 = (
+            ((v2 >> (u64::BITS + u32::BITS)) as usize),
+            ((v2 >> u64::BITS) & u32::MAX as u128) as u32,
+            (v2 & u64::MAX as u128) as u64,
+        );
+        chain_add(o1, o2)
+    };
+    let chain_div2 = |value: (usize, u32, u64)| -> (usize, u32, u64) {
+        (
+            value.0 >> 1,
+            (value.1 >> 1) | (((value.0 & 0x1) as u32) << (u32::BITS - 1)),
+            (value.2 >> 1) | (((value.1 & 0x1) as u64) << (u64::BITS - 1)),
+        )
+    };
+    let chain_round = |value: (usize, u32, u64)| -> (usize, u32) {
+        if value.2 >= (1 << (u64::BITS - 1)) {
+            let (v1, c) = value.1.carrying_add(1, false);
+            (value.0.saturating_add(c as usize), v1)
+        } else {
+            (value.0, value.1)
+        }
+    };
+
     let resampling_filter = function.get_resampling_filter();
-    let scale = in_size.as_() / out_size.as_();
+
+    let e32: T = (1u32 << 16).as_() * (1u32 << 16).as_();
+    let de32: T = T::one() / e32;
+    let fixed_to_float = |x: FractIndex| -> T { x.int.as_() + de32 * x.frac.as_() };
+
+    let in_width = fixed_sub(in_start, in_end);
+
+    let scale = fixed_to_float(in_width) / out_size.as_();
+    // Note that this a) rounds down, so multiplying by out_size won't overflow
+    // b) has 1/(1<<(u32::BITS + usize::BITS)) error, so adding together `out_size`
+    // steps will have < 1/(1<<(u32::BITS)) error at the end
+    let in_step = chain_div((in_width.int, in_width.frac, 0), out_size);
+    let half_step = chain_div2(in_step);
+
     let is_resizable_kernel = resampling_filter.is_resizable_kernel;
     let filter_scale_cutoff = match is_resizable_kernel {
         true => scale.max(1f32.as_()),
@@ -80,7 +152,11 @@ where
     if !is_area {
         let base_size: usize = (filter_base_size.as_() * filter_scale_cutoff).round().as_();
         let kernel_size = base_size;
-        let filter_radius = base_size.as_() / 2.as_();
+        let filter_radius = (base_size.as_() / 2.as_()).max(0.5.as_());
+        let (filter_radius_int, filter_radius_fract): (usize, u32) = (
+            filter_radius.floor().as_(),
+            AsPrimitive::<usize>::as_(filter_radius.fract() * e32).min(u32::MAX as usize) as u32,
+        );
         let filter_scale = 1f32.as_() / filter_scale_cutoff;
         let mut weights: Vec<T> = vec![T::default(); kernel_size * out_size];
         let mut local_filters = vec![T::default(); kernel_size];
@@ -96,21 +172,34 @@ where
             }
         };
 
-        for (i, bound) in bounds.iter_mut().enumerate() {
-            let center_x = ((i.as_() + 0.5.as_()) * scale).min(in_size.as_());
+        let mut center_acc = chain_add(half_step, (in_start.int, in_start.frac, 0));
+        for bound in bounds.iter_mut() {
+            let (center_int, center_frac) = chain_round(center_acc);
+            center_acc = chain_add(center_acc, in_step);
+
             let mut weights_sum: T = 0f32.as_();
 
-            let start: usize = (center_x - filter_radius).floor().max(0f32.as_()).as_();
-            let end: usize = (center_x + filter_radius)
-                .ceil()
-                .min(in_size.as_())
-                .min(start.as_() + kernel_size.as_())
-                .as_();
-
-            let center = center_x - 0.5.as_();
+            let mut start: usize = center_int.saturating_sub(filter_radius_int);
+            if filter_radius_fract > center_frac {
+                start = start.saturating_sub(1);
+            }
+            let (ec, carry) = filter_radius_fract.overflowing_add(center_frac);
+            let mut end: usize = center_int.saturating_add(filter_radius_int);
+            end = end.saturating_add((ec > 0) as usize + carry as usize);
+            end = end.min(in_size).min(start.saturating_add(kernel_size));
 
             for (local_filter_iteration, k) in (start..end).enumerate() {
-                let dx = k.as_() - center;
+                let mut dx_int = k.abs_diff(center_int).as_();
+                if k < center_int {
+                    dx_int = -dx_int;
+                }
+                let mut dx_frac = center_frac.abs_diff(0x80000000).as_() * de32;
+                if center_frac > 0x80000000 {
+                    dx_frac = -dx_frac;
+                };
+
+                let dx = dx_int + dx_frac;
+
                 let weight;
                 if let Some(resampling_window) = window_func {
                     let mut x = dx.abs();
@@ -160,7 +249,7 @@ where
                 for dst in weights.iter_mut().skip(filter_position).take(size) {
                     *dst = 0f32.as_();
                 }
-                let center_tap: usize = (center - start.as_()).round().max(0f32.as_()).as_();
+                let center_tap = center_int - start;
                 weights[filter_position + center_tap.min(size - 1)] = 1f32.as_();
             }
 
@@ -186,28 +275,46 @@ where
         let mut local_filters = vec![T::default(); kernel_size];
         let mut filter_position = 0usize;
 
-        for (i, bound) in bounds.iter_mut().enumerate() {
+        //
+        //       s_k           s_{k+1}          s_{k+2}
+        //        |               |               |
+        // In *------------------------*------------------------*
+        //              j=h                      j=h+1
+        // Out    +---------------+---------------+
+        //               i=k             i=k+1
+        //
+        //        w_{k,h} = 1       w_{k+1,h} =
+        //                            ratio(ceil(s_{k+1}) - s_{k+1},
+        //                              s_{k+2} - floor(s_{k+2}))
+        //                          w_{k+1,h+1} = 1 - w_{k+1,h}
+        //
+        //  where ratio(x,y) = x/(x+y)
+        //
+
+        let mut pos_acc = (in_start.int, in_start.frac, 0);
+
+        for bound in bounds.iter_mut() {
+            let s_0 = chain_round(pos_acc);
+            pos_acc = chain_add(pos_acc, in_step);
+            let s_1 = chain_round(pos_acc);
+
             let mut weights_sum: T = 0f32.as_();
 
-            let sx: T = (i.as_() * scale).floor();
-            let fx = (i as i64 + 1).as_() - (sx + 1.as_()) * inv_scale;
-            let dx = if fx <= 0.as_() {
-                0.as_()
+            let (start, end, weight0, weight1) = if s_0.0 == s_1.0 || s_1.1 == 0 {
+                (s_0.0, s_0.0 + 1, T::one(), T::zero())
             } else {
-                fx - fx.floor()
+                let r = if s_1.0 == s_0.0 + 1 {
+                    s_1.1.as_() * de32
+                } else {
+                    1.as_()
+                };
+                let w1 = (r * inv_scale).min(1.as_());
+                let w0 = 1.as_() - w1;
+                (s_0.0, s_0.0 + 2, w0, w1)
             };
-            let dx = dx.abs();
-            let weight0 = 1.as_() - dx;
-            let weight1: T = dx;
+
             local_filters[0] = weight0;
             local_filters[1] = weight1;
-
-            let start: usize = sx.floor().max(0f32.as_()).as_();
-            let end: usize = (sx + kernel_size.as_())
-                .ceil()
-                .min(in_size.as_())
-                .min(start.as_() + kernel_size.as_())
-                .as_();
 
             let size = end - start;
 
@@ -262,7 +369,13 @@ mod tests {
         ];
         for function in functions {
             for (in_size, out_size) in [(100usize, 37usize), (37, 100), (256, 256), (5, 1)] {
-                let filter = generate_weights::<f64>(function, in_size, out_size);
+                let filter = generate_weights::<f64>(
+                    function,
+                    FractIndex::from(0),
+                    FractIndex::from(in_size),
+                    in_size,
+                    out_size,
+                );
                 for (i, chunk) in filter
                     .weights
                     .chunks_exact(filter.kernel_size)
